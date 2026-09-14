@@ -1,0 +1,131 @@
+# Does every player the catalogue points at still play?
+#
+# The site is iframes into third-party players, so it rots with no commit of
+# ours. This is the watch for that.
+#
+# It stays green when a provider dies. That is not our build breaking, it is the
+# internet, and a job that goes red for something no commit caused trains you to
+# ignore red. The alarm is the email. The job only fails when the tooling fails.
+#
+# This repo is public, so nothing here may print what it measured. Output goes
+# to a file and only a status and two counts reach the log; the report is
+# emailed. See the README.
+name: link-health
+
+on:
+  schedule:
+    # Off the hour: everyone's cron fires on the hour and shared runners queue.
+    - cron: '20 5 * * *'
+  workflow_dispatch:
+    inputs:
+      per:
+        description: 'embeds sampled per provider over HTTP'
+        default: '14'
+      browser:
+        # Must be >= the checker's MIN_EVIDENCE (6) or the browser pass gathers
+        # verdicts that are then discarded as insufficient.
+        description: 'embeds rendered per provider HTTP could not judge (>= 6)'
+        default: '8'
+      apply:
+        description: 'write the measured ranking back'
+        type: boolean
+        default: true
+
+concurrency:
+  group: link-health
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+      exposed: ${{ steps.check.outputs.exposed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The deploy key is a write key: the repaired ranking is committed back.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r code/requirements.txt >/dev/null
+          # Installed here, not in requirements: only this job renders pages.
+          pip install playwright >/dev/null
+          python -m playwright install --with-deps chromium >/dev/null
+
+      # The checker writes status, exposed and summary to $GITHUB_OUTPUT itself.
+      # Its stdout names providers, so it is redirected; `|| true` is NOT a
+      # swallowed failure here, the next step decides on the exit code.
+      - name: Probe embeds
+        id: check
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          python scripts/watch/link_health.py \
+            --per "${{ github.event.inputs.per || 14 }}" \
+            --browser "${{ github.event.inputs.browser || 8 }}" \
+            ${{ (github.event_name == 'schedule' || github.event.inputs.apply == 'true') && '--apply' || '' }} \
+            --json ../link-health.json \
+            --markdown ../link-health.md > ../watch.log 2>&1 || rc=$?
+          # Captured, not swallowed: the default shell is `bash -e`, so without
+          # `|| rc=$?` a failing checker would end the step here and the alert
+          # below would never see an exit code to report.
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status:  ${{ steps.check.outputs.status || 'unknown' }}"
+          echo "exposed: ${{ steps.check.outputs.exposed || 'unknown' }}"
+          echo "report:  $(wc -l < link-health.md 2>/dev/null || echo 0) lines, emailed"
+
+      # Committing the repaired ranking is what makes this a fix rather than a
+      # report: one JSON file, ordering only, never the catalogue. The checker
+      # refuses to write it when the run was inconclusive.
+      - name: Commit the repaired ranking
+        if: steps.check.outputs.status != 'inconclusive'
+        working-directory: code
+        run: |
+          if git diff --quiet -- data/providers.json; then
+            echo "ranking unchanged"; exit 0
+          fi
+          git config user.name  "link-health"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/providers.json
+          git commit -q -m "Re-rank players from measured liveness
+
+          ${{ steps.check.outputs.summary }}"
+          git push
+
+      # Mail when the site is degraded or broken, and when the job itself died.
+      # Not on 'ok', and not on 'inconclusive': a run that could not reach the
+      # providers is a non-event, and mailing it would train the alert away.
+      - name: Mail
+        if: always() && (steps.check.outputs.rc != '0' || steps.check.outputs.status == 'broken' || steps.check.outputs.status == 'degraded')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] players ${{ steps.check.outputs.status || 'check failed' }} (${{ steps.check.outputs.exposed || '?' }} entries affected)" \
+            --note "Exit code ${{ steps.check.outputs.rc || 'none' }}. The ranking has already been re-applied if the run was conclusive, so the next build routes around whatever died." \
+            --body-file link-health.md --body-file watch.log
+
+      # Red only when the tooling itself failed, never because a player died.
+      - name: Fail if the checker did
+        if: steps.check.outputs.rc != '0'
+        run: |
+          echo "the checker exited ${{ steps.check.outputs.rc }}"; exit 1

@@ -1,0 +1,80 @@
+# Do the tests pass and does the site still build from the committed catalogue?
+#
+# This used to run on every push in the private repo, which billed that
+# account's minutes. Here it is nightly and on dispatch. The trade is real and
+# deliberate: a bad commit is now caught within a day rather than within a
+# minute, and the run costs nothing. Dispatch it by hand before anything that
+# matters.
+#
+# This repo is public, so no step may print what it built. Output goes to a
+# file and the tail is emailed on failure.
+name: build-check
+
+on:
+  schedule:
+    - cron: '40 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: build-check
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r code/requirements.txt pytest >/dev/null
+
+      # One step per check so the email names which one failed. Each keeps its
+      # own log file, and no log is ever printed here.
+      - name: Run the checks
+        id: checks
+        working-directory: code
+        run: |
+          rc=0
+          run() {
+            name=$1; shift
+            if "$@" > "../$name.log" 2>&1; then echo "$name: ok"
+            else echo "$name: FAILED"; echo "$name" >> ../failed.txt; rc=1; fi
+          }
+          run tests    python -m pytest tests/ -q
+          # The catalogue is committed, so the build is reproducible here. This
+          # is the check that catches a duplicate slug silently overwriting a
+          # page. example.invalid keeps the real host out of a public log.
+          run build    python site/build.py --base-url https://example.invalid
+          run verify   python site/verify.py
+          # Cheap invariant with a history: the crawler once stored ad frames
+          # and cam-site redirects as players.
+          run hosts    python scripts/check/embed_hosts.py
+          echo "failed=$(tr '\n' ' ' < ../failed.txt 2>/dev/null)" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Mail on failure
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          files=""
+          for f in tests build verify hosts; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          python3 scripts/mail.py \
+            --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
+            --note "Nightly build check failed." $files
