@@ -1,0 +1,85 @@
+# Do the storage credentials still work, and does the image domain still serve?
+#
+# The site can be up and the build green while storage has quietly stopped
+# accepting our keys: a rotated credential, a deleted bucket, a custom domain
+# that fell off its binding. None of that shows on a page already cached at the
+# edge. It shows at the next deploy, which is the worst moment to find it.
+#
+# So this authenticates for real, every day, and is red on any failure. A
+# missing secret is also red: a check that disables itself when unconfigured
+# reports health it never measured.
+#
+# Public repo: no bucket name, no domain, and no key reaches the log. The report
+# that names them is emailed.
+name: storage-check
+
+on:
+  schedule:
+    - cron: '35 7 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: storage-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # boto3 is installed here rather than in the private repo's requirements:
+      # only this job signs a storage request, and the crawl has no use for it.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install boto3 >/dev/null
+
+      - name: Authenticate and list
+        id: check
+        working-directory: code
+        continue-on-error: true
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_IMG_BUCKET: ${{ secrets.R2_IMG_BUCKET }}
+          R2_IMG_URL: ${{ secrets.R2_IMG_URL }}
+        run: |
+          rc=0
+          python scripts/watch/r2_check.py --report ../storage.txt > ../storage.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.check.outputs.status || 'unknown' }}"
+          echo "exit:   ${{ steps.check.outputs.rc }}"
+
+      - name: Mail on failure
+        if: always() && steps.check.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] storage check failed (exit ${{ steps.check.outputs.rc }})" \
+            --note "Credentials, bucket listing or the public image domain failed. A deploy will fail the same way until this is fixed." \
+            --body-file storage.txt --body-file storage.log
+
+      - name: Fail
+        if: steps.check.outputs.rc != '0'
+        run: exit 1

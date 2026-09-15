@@ -1,0 +1,87 @@
+# Is the front door open, and do real pages still come out right?
+#
+# The other watches cover the neighbours: link-health presses play on the
+# third-party players, build-check builds from the catalogue, storage-check
+# authenticates to the bucket. None of them notices the site itself returning a
+# 500, a sitemap that vanished, or a page that lost its poster.
+#
+# The load-bearing assertion is the last one: a page can answer 200 and still
+# ship a canonical pointing at a video file, or a poster hotlinked from an
+# upstream. Both have happened here. The hotlink is the serious one, because
+# every visitor's browser then announces itself to that upstream, so it is red
+# rather than a warning.
+#
+# Pages are sampled from the live sitemap, never hardcoded, so this cannot rot
+# into checking three URLs that happen to still work. Sampling nothing is a
+# failure: a run that judged no page must not report health.
+#
+# Public repo: the domain arrives as a secret and never reaches the log.
+name: site-up
+
+on:
+  schedule:
+    - cron: '50 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      n:
+        description: 'watch pages to sample'
+        default: '8'
+
+concurrency:
+  group: site-up
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # No install step on purpose: the checker is standard library only, so
+      # there is nothing between the checkout and the measurement that can fail.
+
+      - name: Probe the site
+        id: check
+        working-directory: code
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          rc=0
+          python scripts/watch/site_up.py \
+            --n "${{ github.event.inputs.n || 8 }}" \
+            --report ../site.txt > ../site.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status:   ${{ steps.check.outputs.status || 'unknown' }}"
+          echo "leaks:    ${{ steps.check.outputs.leaks || '?' }}"
+          echo "failures: ${{ steps.check.outputs.failures || '?' }}"
+
+      - name: Mail on failure
+        if: always() && steps.check.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] site check failed (${{ steps.check.outputs.failures || '?' }} failures, ${{ steps.check.outputs.leaks || '?' }} image leaks)" \
+            --note "A page answered wrongly, or shipped an upstream host in an image. An image leak means visitors' browsers are reaching that host directly." \
+            --body-file site.txt --body-file site.log
+
+      - name: Fail
+        if: steps.check.outputs.rc != '0'
+        run: exit 1

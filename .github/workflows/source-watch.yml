@@ -1,0 +1,120 @@
+# Is each upstream still publishing, and has any of them gone dark?
+#
+# The catalogue grows from upstreams that change with no commit of ours, so
+# nothing in a build or a test can tell you one of them stopped. This asks each
+# one how much it lists, records the answer, and compares against yesterday.
+#
+# It DETECTS. It does not crawl. The catalogue is 465 MB and lives on the home
+# fleet, and the largest upstreams refuse a datacenter IP on their content
+# pages, so a runner cannot grow it. What a runner can do, measured, is read the
+# count each upstream publishes about itself. The crawl that acts on this alert
+# runs where it already runs.
+#
+# Green when an upstream GREW: new content is the good case, and a job that goes
+# red for good news trains you to ignore red. Red only when one goes dark or
+# shrinks, which is the thing worth waking up for.
+#
+# This repo is public, so no step may print which upstream did what. Counts and
+# statuses reach the log; the report that names them is emailed. See the README.
+name: source-watch
+
+on:
+  schedule:
+    # 25 past, off the hour: shared runners queue at :00.
+    - cron: '25 6 * * *'
+  workflow_dispatch:
+    inputs:
+      write_baseline:
+        description: 'commit the updated baseline'
+        type: boolean
+        default: true
+
+concurrency:
+  group: source-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # A write key: the baseline is committed back, the way link-health commits
+      # the ranking. Without that the "since last check" delta cannot exist.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r code/requirements.txt >/dev/null
+
+      # Its stdout is already safe (counts only); the report naming upstreams
+      # goes to a file. `|| rc=$?` captures rather than swallows: the default
+      # shell is `bash -e`, so without it a failing watcher would end the step
+      # and the alert below would never see an exit code.
+      - name: Ask each upstream what it lists
+        id: watch
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          python scripts/watch/source_watch.py \
+            --json ../source-watch.json \
+            --markdown ../source-watch.md \
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.write_baseline != 'true' && '--no-write' || '' }} \
+            > ../watch.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # The script writes status/notify/alarm/grew/dark to $GITHUB_OUTPUT.
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.watch.outputs.status || 'unknown' }}"
+          echo "grew:   ${{ steps.watch.outputs.grew || '?' }} upstream(s) have new content"
+          echo "dark:   ${{ steps.watch.outputs.dark || '?' }} upstream(s) stopped answering"
+          echo "report: $(wc -l < source-watch.md 2>/dev/null || echo 0) lines, emailed"
+
+      # One file, counts only, no hostnames. It is what makes "since last check"
+      # mean anything, so a run that could not judge refuses to write it (rc=2).
+      - name: Commit the baseline
+        if: steps.watch.outputs.rc != '2' && (github.event_name == 'schedule' || github.event.inputs.write_baseline == 'true')
+        working-directory: code
+        run: |
+          if git diff --quiet -- data/watch/source_baseline.json; then
+            echo "baseline unchanged"; exit 0
+          fi
+          git config user.name  "source-watch"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/watch/source_baseline.json
+          git commit -q -m "Record what each upstream listed today"
+          git push
+
+      # Mail on anything actionable: new content to crawl, an upstream gone
+      # quiet, one gone dark, or the watcher itself dying. Not on a clean
+      # unchanged run, which is most days.
+      - name: Mail
+        if: always() && (steps.watch.outputs.rc == '2' || steps.watch.outputs.notify == 'yes' || steps.watch.outputs.rc != '0')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] upstreams ${{ steps.watch.outputs.status || 'check failed' }} (${{ steps.watch.outputs.grew || '?' }} with new content, ${{ steps.watch.outputs.dark || '?' }} dark)" \
+            --note "Detection only; nothing was crawled. An upstream listed as grown is ready for the next crawl pass. One listed dark stopped answering entirely." \
+            --body-file source-watch.md --body-file watch.log
+
+      # Red when an upstream died or the watcher broke, never because one grew.
+      - name: Fail on a dark upstream or a broken watcher
+        if: steps.watch.outputs.rc != '0'
+        run: |
+          echo "source_watch exited ${{ steps.watch.outputs.rc }}"; exit 1

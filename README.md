@@ -18,6 +18,30 @@ cannot be both, so there are two.
 Each workflow checks this repo out at the root, mounts the private repo at
 `code/`, and calls into it.
 
+## What runs
+
+| workflow | cadence | asks | red when |
+|---|---|---|---|
+| `build-check` | nightly | do the tests pass and does it still build | a test or the build fails |
+| `link-health` | daily | do the third-party players still play | the checker itself breaks |
+| `source-watch` | daily | is each upstream still publishing, or gone dark | an upstream dies or shrinks |
+| `storage-check` | daily | do the storage credentials and image domain work | any of them fails |
+| `site-up` | every 6h | is the front door open and are pages correct | a page is wrong or leaks an upstream host |
+
+Three of these are deliberately green on bad news from the outside world and
+only red on our own breakage, because a job that goes red for something no
+commit caused trains you to ignore red. `link-health` stays green when a player
+dies and `source-watch` stays green when an upstream publishes more; both still
+email. The alarm is the mail, not the colour.
+
+**`source-watch` detects, it does not crawl.** The catalogue is far too large to
+live here and the biggest upstreams refuse a datacenter IP on their content
+pages, so a runner cannot grow it. What a runner can do is read the count each
+upstream publishes about itself, which is enough to say "there is new work" and
+"this one stopped answering". The crawl that acts on that runs where it already
+runs. It keeps one small file of counts in the private repo and commits it back,
+which is what makes "since yesterday" mean anything.
+
 ## Nothing here is identifying, including in the logs
 
 Not a hostname, a path, a brand or an address, and not in a comment either.
@@ -28,6 +52,8 @@ Everything specific arrives at run time:
 | `vars.PRIVATE_REPO` | the repo to check out |
 | `secrets.PIPELINE_DEPLOY_KEY` | reads and writes it |
 | `secrets.ALERT_EMAIL`, `secrets.EMAIL_FROM` | who is told when something breaks |
+| `secrets.SITE_URL` | the site `site-up` probes |
+| `secrets.R2_*` | endpoint, key, secret, bucket, image bucket and a public image URL |
 | the private repo | every upstream host, the catalogue, the site |
 
 Two rules follow from the repo being public, and both are load-bearing:
