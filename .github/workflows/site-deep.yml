@@ -1,0 +1,105 @@
+# The deep live checks for the 200-but-broken failures.
+#
+# Every one of these was a real regression that returned 200 and passed every
+# status-code check: a video sitemap naming a source host for player_loc, a
+# poster hotlinked from a source in a visible <img>, a missing media-src that
+# left 12,933 titles unplayable, a versioned stylesheet the edge served stale, a
+# VideoObject with no uploadDate that Google discarded, a bogus URL answering
+# 200. Each is our own output, so each is red.
+#
+# It also runs the slug-redirect check when a build renamed URLs: a redirect
+# that 301s into a 404 is a 404 with extra steps.
+#
+# Public repo: SITE_URL is a secret and the report that names hosts and URLs is
+# emailed; stdout is counts only.
+name: site-deep
+
+on:
+  schedule:
+    - cron: '15 8 * * *'
+  workflow_dispatch:
+    inputs:
+      n:
+        description: 'watch pages sampled per page-check'
+        default: '10'
+
+concurrency:
+  group: site-deep
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # site_deep is standard library only; the slug check needs nothing extra.
+
+      # Prove the extractors before trusting a zero: a regex that missed the
+      # tag's attribute once reported a leaking sitemap as clean.
+      - name: Self-check the extractors
+        working-directory: code
+        run: python scripts/watch/site_deep.py --selfcheck
+
+      - name: Deep checks
+        id: deep
+        working-directory: code
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          rc=0
+          python scripts/watch/site_deep.py --n "${{ github.event.inputs.n || 10 }}" \
+            --report ../deep.txt > ../deep.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      # Renamed URLs must still answer, and the chain must end at 200. Only runs
+      # when the build actually renamed something.
+      - name: Slug redirects
+        id: slug
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          if [ -s data/slug_redirects.json ] || [ -s dist/_slug_repairs.json ]; then
+            map=$([ -s dist/_slug_repairs.json ] && echo dist/_slug_repairs.json || echo data/slug_redirects.json)
+            python scripts/ci/check_slug_redirects.py "$map" --n 200 > ../slug.log 2>&1 || rc=$?
+          else
+            echo "no slug repair map committed; nothing to check" > ../slug.log
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "deep:   ${{ steps.deep.outputs.status || 'unknown' }} (${{ steps.deep.outputs.failures || '?' }} failures)"
+          echo "slug:   exit ${{ steps.slug.outputs.rc }}"
+
+      - name: Mail on failure
+        if: always() && (steps.deep.outputs.rc != '0' || steps.slug.outputs.rc != '0')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          files=""
+          [ -s deep.txt ] && files="$files --body-file deep.txt"
+          [ -s deep.log ] && files="$files --body-file deep.log"
+          [ -s slug.log ] && files="$files --body-file slug.log"
+          python3 scripts/mail.py \
+            --subject "[watch] deep site check failed (${{ steps.deep.outputs.failures || '?' }} failures)" \
+            --note "A live page, sitemap, CSP, asset or redirect regressed. These are our own output, not third-party rot." $files
+
+      - name: Fail
+        if: steps.deep.outputs.rc != '0' || steps.slug.outputs.rc != '0'
+        run: exit 1

@@ -1,0 +1,82 @@
+# The free-cap tripwire, before it trips.
+#
+# The site went down site-wide once with a 429 at the daily request cap, from
+# crawler traffic, not a deploy. A homepage check catches that only once it is
+# already an outage; the request count catches it hours earlier.
+#
+# Runs every 3 hours because the cap is a daily budget that a crawl can burn
+# through fast. Red at the threshold, and red immediately on a 429. The alert
+# runs from the runner, never from the site being watched.
+name: capacity
+
+on:
+  schedule:
+    - cron: '5 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      cap:
+        description: 'daily request cap'
+        default: '100000'
+      pct:
+        description: 'alert at this fraction (0-1)'
+        default: '0.8'
+
+concurrency:
+  group: capacity
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Standard library only, so nothing between checkout and the measurement.
+
+      - name: Check the request budget
+        id: cap
+        working-directory: code
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          rc=0
+          python scripts/watch/capacity_check.py \
+            --cap "${{ github.event.inputs.cap || 100000 }}" \
+            --pct "${{ github.event.inputs.pct || 0.8 }}" \
+            --report ../cap.txt > ../cap.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.cap.outputs.status || 'unknown' }}"
+          echo "usage:  ${{ steps.cap.outputs.pct || '?' }}% of the cap"
+
+      - name: Mail on threshold or 429
+        if: always() && steps.cap.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] capacity ${{ steps.cap.outputs.status || 'check failed' }} (${{ steps.cap.outputs.pct || '?' }}% of cap)" \
+            --note "The request budget crossed its threshold, or the site is already returning 429. Act before or during, not after." \
+            --body-file cap.txt --body-file cap.log
+
+      - name: Fail
+        if: steps.cap.outputs.rc != '0'
+        run: exit 1

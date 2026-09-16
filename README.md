@@ -27,6 +27,8 @@ Each workflow checks this repo out at the root, mounts the private repo at
 | `source-watch` | daily | is each upstream still publishing, or gone dark | an upstream dies or shrinks |
 | `storage-check` | daily | do the storage credentials and image domain work | any of them fails |
 | `site-up` | every 6h | is the front door open and are pages correct | a page is wrong or leaks an upstream host |
+| `site-deep` | daily | the 200-but-broken failures: sitemap host purity, page image/JSON-LD leaks, CSP permits what pages load, versioned asset serves current, uploadDate coverage, soft-404, slug redirects | any of them regresses |
+| `capacity` | every 3h | the day's request count against the free cap, and the homepage is not 429 | usage crosses the threshold, or a 429 is already serving |
 
 Three of these are deliberately green on bad news from the outside world and
 only red on our own breakage, because a job that goes red for something no
@@ -52,8 +54,9 @@ Everything specific arrives at run time:
 | `vars.PRIVATE_REPO` | the repo to check out |
 | `secrets.PIPELINE_DEPLOY_KEY` | reads and writes it |
 | `secrets.ALERT_EMAIL`, `secrets.EMAIL_FROM` | who is told when something breaks |
-| `secrets.SITE_URL` | the site `site-up` probes |
+| `secrets.SITE_URL` | the site `site-up`, `site-deep` and `capacity` probe |
 | `secrets.R2_*` | endpoint, key, secret, bucket, image bucket and a public image URL |
+| `secrets.CLOUDFLARE_API_TOKEN`, `secrets.CF_ZONE_ID` | the request-count read for `capacity` (token needs Analytics: Read) |
 | the private repo | every upstream host, the catalogue, the site |
 
 Two rules follow from the repo being public, and both are load-bearing:
