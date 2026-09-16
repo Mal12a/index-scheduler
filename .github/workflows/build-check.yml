@@ -62,6 +62,15 @@ jobs:
           # Cheap invariant with a history: the crawler once stored ad frames
           # and cam-site redirects as players.
           run hosts    python scripts/check/embed_hosts.py
+          # A fleet script that reports progress it did not verify per slice
+          # once called a 12-box crawl complete while 6 boxes had written zero
+          # rows: 26,904 codes reported crawled and never were.
+          run fleet    python scripts/ci/check_fleet_scripts.py
+          # The build drops a dead embed only if the sidecar says so, so a
+          # sidecar that goes missing or stops regenerating silently stops the
+          # dropping while everything stays green. --allow-empty only while the
+          # first full pass is still running; remove it once it has landed.
+          run sidecar  python scripts/ci/check_dead_embeds_sidecar.py --allow-empty
           echo "failed=$(tr '\n' ' ' < ../failed.txt 2>/dev/null)" >> "$GITHUB_OUTPUT"
           exit $rc
 
@@ -74,7 +83,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build verify hosts; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build verify hosts fleet sidecar; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files
