@@ -28,6 +28,7 @@ Each workflow checks this repo out at the root, mounts the private repo at
 | `storage-check` | daily | do the storage credentials and image domain work | any of them fails |
 | `site-up` | every 6h | is the front door open and are pages correct | a page is wrong or leaks an upstream host |
 | `site-deep` | daily | the 200-but-broken failures: sitemap host purity, page image/JSON-LD leaks, CSP permits what pages load, versioned asset serves current, uploadDate coverage, soft-404, slug redirects | any of them regresses |
+| `server-health` | daily | do the servers actually deliver video bytes, or only 200s | a provider stops delivering, or the finding cannot be delivered to Sentry |
 | `capacity` | every 3h | the day's request count against the free cap, and the homepage is not 429 | usage crosses the threshold, or a 429 is already serving |
 
 Three of these are deliberately green on bad news from the outside world and

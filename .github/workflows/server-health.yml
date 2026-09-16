@@ -1,0 +1,115 @@
+# Do the servers actually deliver video, or only claim to?
+#
+# Two providers were 200 at every layer the other checks read: one served an
+# embed whose body said the file had expired, the other served a 200 embed, a
+# 200 master playlist and a 200 variant while every media segment 522'd. Only
+# the segment tells the truth, and the playlist is built in JS so no HTTP-only
+# status check can reach it.
+#
+# No browser. Measured: headless Chromium made 9 requests with zero media on a
+# WORKING embed, and real headed Chrome 13, also zero, because these players
+# load the stream on a gesture behind an ad iframe. The stream url is in the
+# page all along, so the check unpacks it and walks to the first segment.
+#
+# It reports to Sentry and exits 3 when the finding could NOT be delivered, so a
+# dropped alert is still a red run. Provider names are hashed in this log; the
+# named report goes to Sentry and the email.
+name: server-health
+
+on:
+  schedule:
+    - cron: '45 9 * * *'
+  workflow_dispatch:
+    inputs:
+      per:
+        description: 'embeds sampled per provider'
+        default: '5'
+      write_baseline:
+        description: 'record the per-provider rates'
+        type: boolean
+        default: true
+
+concurrency:
+  group: server-health
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # curl_cffi only: some of these providers 403 a plain client on TLS
+      # fingerprint, which is not a block verdict and must not read as one.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r code/requirements.txt curl_cffi >/dev/null
+
+      - name: Probe the servers
+        id: probe
+        working-directory: code
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          rc=0
+          python scripts/watch/server_health.py \
+            --per "${{ github.event.inputs.per || 5 }}" \
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.write_baseline != 'true' && '--no-write' || '' }} \
+            --report ../servers.txt > ../servers.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status:  ${{ steps.probe.outputs.status || 'unknown' }}"
+          echo "alarms:  ${{ steps.probe.outputs.alarms || '0' }}"
+          echo "exit:    ${{ steps.probe.outputs.rc }} (2 = inconclusive, 3 = alarm undelivered)"
+
+      # The per-provider rates are what make "below its own baseline" mean
+      # something. Not written when the run was inconclusive (exit 2), so a
+      # harness failure cannot overwrite good rates with zeros.
+      - name: Commit the baseline
+        if: steps.probe.outputs.rc != '2' && (github.event_name == 'schedule' || github.event.inputs.write_baseline == 'true')
+        working-directory: code
+        run: |
+          if git diff --quiet -- data/watch/provider_baseline.json; then
+            echo "baseline unchanged"; exit 0
+          fi
+          git config user.name  "server-health"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/watch/provider_baseline.json
+          git commit -q -m "Record what each server delivered today"
+          git push
+
+      - name: Mail
+        if: always() && (steps.probe.outputs.rc == '1' || steps.probe.outputs.rc == '3')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] servers not delivering (${{ steps.probe.outputs.alarms || '?' }} provider(s))" \
+            --note "A provider's playlists may be fine while its segments fail. Exit 3 means Sentry did not accept the report, so this mail is the only copy." \
+            --body-file servers.txt --body-file servers.log
+
+      # Red on a real finding (1) and on an undelivered one (3). NOT on 2:
+      # inconclusive means the harness could not observe playback, and going red
+      # for that trains the alarm away.
+      - name: Fail
+        if: steps.probe.outputs.rc == '1' || steps.probe.outputs.rc == '3'
+        run: exit 1
