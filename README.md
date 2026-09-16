@@ -37,13 +37,19 @@ commit caused trains you to ignore red. `link-health` stays green when a player
 dies and `source-watch` stays green when an upstream publishes more; both still
 email. The alarm is the mail, not the colour.
 
-**`source-watch` detects, it does not crawl.** The catalogue is far too large to
-live here and the biggest upstreams refuse a datacenter IP on their content
-pages, so a runner cannot grow it. What a runner can do is read the count each
-upstream publishes about itself, which is enough to say "there is new work" and
-"this one stopped answering". The crawl that acts on that runs where it already
-runs. It keeps one small file of counts in the private repo and commits it back,
-which is what makes "since yesterday" mean anything.
+**`source-watch` detects, it does not crawl.** Not because a runner could not:
+the WordPress upstreams answer a datacenter IP perfectly well, and one of them
+has been crawled from two cloud boxes. Only the challenge-protected one refuses,
+and it is not among the sources this watches. The reason is that the catalogue
+is far too large to live here, and growing it is the home fleet's job. What a
+runner does cheaply is read the count each upstream publishes about itself,
+which is enough to say "there is new work" and "this one stopped answering". It
+keeps one small file of counts in the private repo and commits it back, which is
+what makes "since yesterday" mean anything.
+
+Worth knowing: nothing currently schedules the crawl that acts on this. The
+latency between an upstream publishing and the site showing it is whoever runs
+it, not the detection.
 
 ## Nothing here is identifying, including in the logs
 
@@ -58,6 +64,7 @@ Everything specific arrives at run time:
 | `secrets.SITE_URL` | the site `site-up`, `site-deep` and `capacity` probe |
 | `secrets.R2_*` | endpoint, key, secret, bucket, image bucket and a public image URL |
 | `secrets.CLOUDFLARE_API_TOKEN`, `secrets.CF_ZONE_ID` | the request-count read for `capacity` (token needs Analytics: Read) |
+| `secrets.SENTRY_DSN` | where `server-health` reports a provider that stopped delivering |
 | the private repo | every upstream host, the catalogue, the site |
 
 Two rules follow from the repo being public, and both are load-bearing:
