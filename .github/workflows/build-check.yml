@@ -68,9 +68,9 @@ jobs:
           run fleet    python scripts/ci/check_fleet_scripts.py
           # The build drops a dead embed only if the sidecar says so, so a
           # sidecar that goes missing or stops regenerating silently stops the
-          # dropping while everything stays green. --allow-empty only while the
-          # first full pass is still running; remove it once it has landed.
-          run sidecar  python scripts/ci/check_dead_embeds_sidecar.py --allow-empty
+          # dropping while everything stays green. The first full pass has
+          # landed, so an empty sidecar is now a real failure.
+          run sidecar  python scripts/ci/check_dead_embeds_sidecar.py
           echo "failed=$(tr '\n' ' ' < ../failed.txt 2>/dev/null)" >> "$GITHUB_OUTPUT"
           exit $rc
 
