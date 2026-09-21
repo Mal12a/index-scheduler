@@ -1,0 +1,107 @@
+# Names the exact new pages each upstream published, and writes them to a
+# committed queue the crawl fleet consumes. Detection only: nothing is crawled
+# here, because the catalogue is too large to hold on a runner and some
+# upstreams refuse a datacenter IP on their content pages. Listing works from
+# anywhere, so that is the part that lives here.
+#
+# Never red for new content. Red only if it could not list a single upstream,
+# which is this job being broken rather than an upstream dying; an upstream
+# going dark is source-watch's verdict and it already fails for one.
+name: new-urls
+
+on:
+  schedule:
+    # An hour after source-watch, so "it grew" and "here is what grew" land in
+    # order rather than racing for the same baseline commit.
+    - cron: '25 7 * * *'
+  workflow_dispatch:
+    inputs:
+      per_source:
+        description: 'most new URLs to take from one upstream'
+        default: '500'
+      write_queue:
+        description: 'commit the queue and frontier'
+        default: 'true'
+
+concurrency:
+  # Two runs would both append to the queue and both push the frontier, and the
+  # loser's URLs would be dropped by the push rather than crawled.
+  group: new-urls
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip >/dev/null
+          pip install -r code/requirements.txt >/dev/null
+
+      - name: List what is new on each upstream
+        id: detect
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          python scripts/watch/new_urls.py \
+            --per-source ${{ github.event.inputs.per_source || 500 }} \
+            --markdown ../new-urls.md \
+            ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.write_queue != 'true' && '--no-write' || '' }} \
+            > ../detect.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      # Counts only. Every line of the report names an upstream, and these logs
+      # are world-readable, so the report goes to the mail instead.
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.detect.outputs.status || 'unknown' }}"
+          echo "queued: ${{ steps.detect.outputs.queued || '?' }} new URL(s)"
+          echo "dark:   ${{ steps.detect.outputs.dark || '?' }} upstream(s) did not answer"
+
+      - name: Commit the queue
+        if: steps.detect.outputs.rc != '2' && (github.event_name == 'schedule' || github.event.inputs.write_queue == 'true')
+        working-directory: code
+        run: |
+          if git diff --quiet -- data/watch/; then
+            echo "queue unchanged"; exit 0
+          fi
+          git config user.name  "new-urls"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/watch/crawl_queue.jsonl data/watch/url_frontier.json data/watch/queue
+          git commit -q -m "Queue the pages upstreams published since the last run"
+          # Another job may have pushed between checkout and now. Rebase rather
+          # than force: the queue is append-only and both sides' URLs matter.
+          git pull --rebase --quiet || true
+          git push
+
+      - name: Mail
+        if: always() && (steps.detect.outputs.rc == '2' || steps.detect.outputs.notify == 'yes')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[queue] ${{ steps.detect.outputs.queued || '?' }} new URL(s) ready to crawl" \
+            --note "Detection only; nothing was crawled. The fleet consumes this with scripts/crawl/queue_crawl.py --site <source>, and --remaining shows what is outstanding." \
+            --body-file new-urls.md --body-file detect.log
+
+      - name: Fail only if nothing could be listed
+        if: steps.detect.outputs.rc == '2'
+        run: |
+          echo "new_urls could not list a single upstream"; exit 1
