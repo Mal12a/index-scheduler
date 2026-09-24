@@ -1,0 +1,59 @@
+# Did the other scheduled checks actually run, and reach their code? Every
+# other workflow here assumes it ran; this is the one that checks. See the
+# docstring of scripts/watchdog.py for the three silent failures it covers.
+#
+# It deliberately checks out nothing private, so it still runs, and still goes
+# red, while the deploy key is missing: the one state in which every other
+# workflow here dies before measuring anything.
+#
+# Shared fate, stated plainly: this lives in the repo it watches, so the 60-day
+# inactivity rule would disable it too. It warns at day 45 while it is itself
+# still scheduled, which leaves two weeks. A copy running from a repo with its
+# own activity is the stronger version and is a decision for the owner.
+name: watchdog
+
+on:
+  schedule:
+    - cron: '40 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Did every scheduled check run and reach its code
+        id: dog
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rc=0
+          python3 scripts/watchdog.py --repo "${{ github.repository }}" > dog.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # Workflow and step names only; nothing here names an upstream.
+          cat dog.log
+
+      - name: Mail
+        if: always() && steps.dog.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watchdog] scheduled checks are not running as designed" \
+            --note "A check that never ran looks exactly like a check that passed. Each line below names the workflow and what is wrong with it." \
+            --body-file dog.log
+
+      - name: Fail on any finding
+        if: steps.dog.outputs.rc != '0'
+        run: |
+          echo "watchdog exited ${{ steps.dog.outputs.rc }}"; exit 1
