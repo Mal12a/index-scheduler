@@ -38,9 +38,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Refuse to start without the deploy key, and say so in plain words. An
+      # empty secret makes actions/checkout drop the ssh-key input silently
+      # and fall back to the API with this public repo's token, which reports
+      # "Not Found - get-a-repository". That reads like a wrong repo name, and
+      # it cost nine days and one wrong diagnosis before the step's printed
+      # inputs showed there was no ssh-key line at all.
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PRIVATE_REPO }}
+          # Pinned so the branch is never resolved through the API. That lookup
+          # is what produced "Not Found - get-a-repository" on every run since
+          # the split, but it was the symptom: it only happens when ssh-key is
+          # EMPTY, and the step above now refuses to start in that case.
+          ref: main
           ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
           path: code
 
