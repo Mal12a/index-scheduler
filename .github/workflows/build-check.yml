@@ -91,8 +91,27 @@ jobs:
           # dropping while everything stays green. The first full pass has
           # landed, so an empty sidecar is now a real failure.
           run sidecar  python scripts/ci/check_dead_embeds_sidecar.py
+          # A loop variable reused a page URL and 10,896 live pages told search
+          # engines their canonical was an MP4. The build is right here, so this
+          # runs against dist rather than production.
+          run canonical python scripts/ci/check_canonical.py --n 2000
+          # Rows that reach the merge but cannot reach the output. A host in
+          # neither the alive nor the refuse set is not refused, it is absent,
+          # and its rows are dropped before anything counts them: 70.8% of held
+          # player URLs were in that state on 2026-09-21.
+          run stage    python scripts/ci/check_stage_yield.py
           echo "failed=$(tr '\n' ' ' < ../failed.txt 2>/dev/null)" >> "$GITHUB_OUTPUT"
           exit $rc
+
+      # Advisory, deliberately not part of `run` above. This reports a standing
+      # policy question, not a regression: an HTML probe can still award first
+      # place to a provider nobody has watched play. Blocking the nightly build
+      # on a decision nobody has made yet trains people to ignore the colour.
+      # It becomes blocking the day the cap is adopted.
+      - name: Ranking floor (advisory)
+        working-directory: code
+        continue-on-error: true
+        run: python scripts/ci/check_ranking_floor.py --report ../ranking.md || true
 
       - name: Mail on failure
         if: failure()
@@ -103,7 +122,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build verify hosts fleet sidecar; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build verify hosts fleet sidecar canonical stage ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files

@@ -131,6 +131,18 @@ jobs:
       # Mail when the site is degraded or broken, and when the job itself died.
       # Not on 'ok', and not on 'inconclusive': a run that could not reach the
       # providers is a non-event, and mailing it would train the alert away.
+      # Presses play in a real browser under the real headers, one page per
+      # provider. Advisory on purpose: it is red from any vantage that cannot
+      # reach the providers, and a gate that cannot tell a dead provider from a
+      # dead uplink blocks everything. The mail is the alarm, not the colour.
+      - name: Playback in a real browser (advisory)
+        continue-on-error: true
+        working-directory: code
+        run: |
+          python -m playwright install --with-deps chromium >/dev/null 2>&1 || true
+          python scripts/ci/check_playback.py --live --n 4 > ../playback.log 2>&1 || true
+          tail -20 ../playback.log
+
       - name: Mail
         if: always() && (steps.check.outputs.rc != '0' || steps.check.outputs.status == 'broken' || steps.check.outputs.status == 'degraded')
         env:
