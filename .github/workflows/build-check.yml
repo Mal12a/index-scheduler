@@ -100,6 +100,12 @@ jobs:
           # and its rows are dropped before anything counts them: 70.8% of held
           # player URLs were in that state on 2026-09-21.
           run stage    python scripts/ci/check_stage_yield.py
+          # A chip says a count and clicking it runs a filter: two artifacts
+          # written by two paths that nothing compared. Exhaustive, not sampled,
+          # because the defect class is a fraction of a percent of 74,785 chips
+          # and a 33-chip sample found none of them. Free here: the job just
+          # built the files.
+          run chips    python scripts/ci/check_chip_counts.py
           echo "failed=$(tr '\n' ' ' < ../failed.txt 2>/dev/null)" >> "$GITHUB_OUTPUT"
           exit $rc
 
@@ -122,7 +128,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build verify hosts fleet sidecar canonical stage ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build verify hosts fleet sidecar canonical stage chips ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files
