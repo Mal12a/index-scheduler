@@ -77,7 +77,11 @@ jobs:
           # stop reading it.
           run() {
             name=$1; shift
-            "$@" > "../$name.log" 2>&1; code=$?
+            # The `if` form on purpose: the default shell is bash -e, so a bare
+            # `"$@"; code=$?` ends the step on the first non-zero exit before the
+            # code is ever read. That is how this rewrite failed at 18s with no
+            # output at all.
+            if "$@" > "../$name.log" 2>&1; then code=0; else code=$?; fi
             if [ $code -eq 0 ]; then echo "$name: ok"
             elif [ $code -eq 2 ]; then echo "$name: NOT CHECKED (no input)"
             else echo "$name: FAILED"; echo "$name" >> ../failed.txt; rc=1; fi
