@@ -1,10 +1,12 @@
-# The free-cap tripwire, before it trips.
+# Where the month's Worker usage is heading, against what the plan includes.
 #
-# The site went down site-wide once with a 429 at the daily request cap, from
+# This account is on Workers Paid: 10,000,000 requests included each month and
+# no daily cap to trip, so the risk is a bill rather than an outage. It was
+# written for the free plan, when the site went down site-wide with a 429, from
 # crawler traffic, not a deploy. A homepage check catches that only once it is
 # already an outage; the request count catches it hours earlier.
 #
-# Runs every 3 hours because the cap is a daily budget that a crawl can burn
+# Runs every 3 hours because a crawl can burn a month's allowance quickly, and
 # through fast. Red at the threshold, and red immediately on a 429. The alert
 # runs from the runner, never from the site being watched.
 name: capacity
@@ -14,9 +16,9 @@ on:
     - cron: '5 */3 * * *'
   workflow_dispatch:
     inputs:
-      cap:
-        description: 'daily request cap'
-        default: '100000'
+      included:
+        description: 'requests included per month by the plan'
+        default: '10000000'
       pct:
         description: 'alert at this fraction (0-1)'
         default: '0.8'
@@ -74,7 +76,7 @@ jobs:
         run: |
           rc=0
           python scripts/watch/capacity_check.py \
-            --cap "${{ github.event.inputs.cap || 100000 }}" \
+            --included "${{ github.event.inputs.included || 10000000 }}" \
             --pct "${{ github.event.inputs.pct || 0.8 }}" \
             --report ../cap.txt > ../cap.log 2>&1 || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
