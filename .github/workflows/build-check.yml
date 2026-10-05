@@ -68,17 +68,39 @@ jobs:
         working-directory: code
         run: |
           rc=0
+          # Exit 2 means "could not judge", and it is NOT a finding. Every check
+          # here uses it for a missing input, and treating it as a failure made
+          # the nightly red for seven days straight on checks that had simply
+          # never run: 3 of them reported NOT CHECKED because the build above
+          # them had not produced dist, and the run printed FAILED for each.
+          # A job that is red for things it did not measure teaches people to
+          # stop reading it.
           run() {
             name=$1; shift
-            if "$@" > "../$name.log" 2>&1; then echo "$name: ok"
+            "$@" > "../$name.log" 2>&1; code=$?
+            if [ $code -eq 0 ]; then echo "$name: ok"
+            elif [ $code -eq 2 ]; then echo "$name: NOT CHECKED (no input)"
             else echo "$name: FAILED"; echo "$name" >> ../failed.txt; rc=1; fi
           }
           run tests    python -m pytest tests/ -q
-          # The catalogue is committed, so the build is reproducible here. This
-          # is the check that catches a duplicate slug silently overwriting a
-          # page. example.invalid keeps the real host out of a public log.
-          run build    python site/build.py --base-url https://example.invalid
-          run verify   python site/verify.py
+          # ALLOW_SMALL_CATALOG on purpose, and the comment that used to sit here
+          # was wrong: it said "the catalogue is committed, so the build is
+          # reproducible". The committed copy is a 33 MB snapshot and the real
+          # one is 465 MB, and build.py refuses the small one BY DESIGN because
+          # shipping from it once published a site built from 29,910 entries.
+          # So this exercises the build code path, which catches a crash or a
+          # duplicate slug, and it does NOT validate the real site. Nothing
+          # downstream of it should be read as having seen production.
+          # example.invalid keeps the real host out of a public log.
+          run build    env ALLOW_SMALL_CATALOG=1 python site/build.py --base-url https://example.invalid
+          # NOT run here, deliberately. site/verify.py validates a site that is
+          # about to ship: it asserts thumbnails are present and that no page
+          # names a source host. The small-catalogue build above has neither,
+          # because the thumbnail sidecars are not committed, so it reported
+          # 9,867 page failures that say nothing about production. Running it
+          # on this build would be red every night for a reason no commit
+          # caused. It belongs on the box that does the real build, before a
+          # deploy, and that is where it runs.
           # Cheap invariant with a history: the crawler once stored ad frames
           # and cam-site redirects as players.
           run hosts    python scripts/check/embed_hosts.py
@@ -133,7 +155,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build verify hosts fleet sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build hosts fleet sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files
