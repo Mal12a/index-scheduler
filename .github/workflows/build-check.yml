@@ -97,6 +97,12 @@ jobs:
           # downstream of it should be read as having seen production.
           # example.invalid keeps the real host out of a public log.
           run build    env ALLOW_SMALL_CATALOG=1 python site/build.py --base-url https://example.invalid
+          # Read what the build just said about itself. Some stages fail OPEN
+          # on purpose, because a false "down" unpublishes thousands of indexed
+          # pages while a false "up" leaves one dead button. The cost of that
+          # default is that a probe which can never answer degrades silently to
+          # "always attach", and the only symptom is one line in this log.
+          run faillog  python scripts/ci/check_build_log.py ../build.log
           # NOT run here, deliberately. site/verify.py validates a site that is
           # about to ship: it asserts thumbnails are present and that no page
           # names a source host. The small-catalogue build above has neither,
@@ -164,7 +170,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build hosts fleet calls sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build faillog hosts fleet calls sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files
