@@ -112,6 +112,11 @@ jobs:
           # once called a 12-box crawl complete while 6 boxes had written zero
           # rows: 26,904 codes reported crawled and never were.
           run fleet    python scripts/ci/check_fleet_scripts.py
+          # A workflow calling a script is a caller no import graph, type checker
+          # or test suite can see. Renaming --cap to --included broke this very
+          # job's sibling and nothing failed until the schedule fired. Run from
+          # the public repo's own checkout, with the private code at code/.
+          run calls    python3 ../scripts/check_workflow_calls.py --code .
           # The build drops a dead embed only if the sidecar says so, so a
           # sidecar that goes missing or stops regenerating silently stops the
           # dropping while everything stays green. The first full pass has
@@ -159,7 +164,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           files=""
-          for f in tests build hosts fleet sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
+          for f in tests build hosts fleet calls sidecar canonical stage chips covers ranking; do [ -s "$f.log" ] && files="$files --body-file $f.log"; done
           python3 scripts/mail.py \
             --subject "[build] failed: ${{ steps.checks.outputs.failed || 'setup' }}" \
             --note "Nightly build check failed." $files
