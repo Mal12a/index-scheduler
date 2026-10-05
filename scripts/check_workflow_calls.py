@@ -32,7 +32,13 @@ import pathlib
 import re
 import sys
 
-WORKFLOWS = pathlib.Path(".github/workflows")
+# Relative to THIS FILE, never the working directory. The nightly runs its
+# steps from code/, the private checkout, which has a .github/workflows of its
+# own: a CWD-relative path read that one instead, found 4 calls in 1 workflow,
+# and printed a clean green having never looked at the 10 workflows it exists
+# to guard. Checking the wrong population is the failure this whole file is
+# about, so the directory it read is printed on every run.
+WORKFLOWS = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows"
 # `python scripts/x.py --a --b`. Continuations are joined BEFORE matching
 # rather than matched across: a pattern like (?:[^\n]|\\\n)* succeeds on the
 # first line and never backtracks into the continuation, so it captured exactly
@@ -119,7 +125,11 @@ def main() -> int:
             # A call may name the script relative to the private checkout or to
             # this repo; try both rather than assume one layout.
             rel = script[len("code/"):] if script.startswith("code/") else script
-            for base in (code, pathlib.Path(".")):
+            # The private checkout for code/… paths, and the repo holding the
+            # workflows for its own scripts. Neither is the working directory:
+            # the nightly runs from code/, where the public repo's mail.py does
+            # not exist, and a cwd-relative guess reported 11 missing scripts.
+            for base in (code, WORKFLOWS.parents[1]):
                 p = base / rel
                 if p.exists():
                     break
@@ -137,7 +147,8 @@ def main() -> int:
         # Matching nothing is the same confident green this is built to prevent.
         print("NOT CHECKED: found no script calls in any workflow")
         return 2
-    print(f"  {checked} script call(s) across {len(list(WORKFLOWS.glob('*.yml')))} workflow(s)")
+    print(f"  {checked} script call(s) across "
+          f"{len(list(WORKFLOWS.glob('*.yml')))} workflow(s) in {WORKFLOWS}")
     for f in fails:
         print(f"  FAIL {f}")
     if fails:
