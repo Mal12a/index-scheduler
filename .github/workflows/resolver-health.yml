@@ -1,0 +1,106 @@
+# Is the home resolver answering, so the source can still play?
+#
+# the source's m3u8 is a signed URL that expires in ~1.75h, and the page that mints
+# it 403s datacenter IPs and the Worker, so one residential fetch runs on a home
+# Mac behind a Cloudflare tunnel. The Worker's /r/ route calls it. When the Mac
+# sleeps or the tunnel drops, /r/ returns no stream and the watch page falls
+# through to the next server: it FAILS SAFE, so no page breaks and nothing else
+# here notices, and that source just silently stops playing. That silence is the whole
+# reason for this probe.
+#
+# /health is served BY the resolver THROUGH the tunnel, so a 200 means the Mac,
+# the process and the tunnel are all up. It is reachable from a datacenter runner
+# because the Mac does the source fetch, not the prober, so this is a legitimate
+# outside probe. It proves the resolver is ALIVE, not that a source resolve
+# succeeds end to end.
+#
+# Every 6 hours, aligned with the other watches so an overnight outage pages a
+# couple of times, not hourly. If that is still too noisy, the next step is a
+# committed last-state file so it mails only on the down transition, the way
+# source-watch keeps a baseline. The alert runs from the runner, never from the
+# Mac, so the thing being watched cannot take down the thing reporting it.
+#
+# Public repo: the health URL is a secret and never reaches the log; only the
+# state (ok / down / unknown) is printed.
+name: resolver-health
+
+on:
+  schedule:
+    - cron: '40 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      attempts:
+        description: 'probe attempts before calling it down (samples both tunnel connectors)'
+        default: '5'
+
+concurrency:
+  group: resolver-health
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Standard library only; a liveness probe that needs a dependency tree can
+      # fail for reasons that have nothing to do with the resolver.
+
+      - name: Probe the resolver
+        id: probe
+        working-directory: code
+        continue-on-error: true
+        env:
+          RESOLVER_HEALTH_URL: ${{ secrets.RESOLVER_HEALTH_URL }}
+        run: |
+          rc=0
+          python scripts/watch/resolver_check.py \
+            --attempts "${{ github.event.inputs.attempts || 5 }}" \
+            --report ../resolver.txt > ../resolver.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../resolver.log
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.probe.outputs.status || 'unknown' }}"
+          echo "state:  ${{ steps.probe.outputs.state || '?' }}"
+          echo "exit:   ${{ steps.probe.outputs.rc }} (2 = could not judge / unset)"
+
+      - name: Mail
+        if: always() && steps.probe.outputs.rc == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[watch] the home resolver is down (${{ steps.probe.outputs.state || '?' }})" \
+            --note "The home-Mac resolver stopped answering /health. The source falls through to the next server so no page breaks, but its playback is off until it is back. Check the Mac is awake and the tunnel is up (ops/home-resolver/README.md)." \
+            --body-file resolver.txt --body-file resolver.log
+
+      # Red only on a real down. Exit 2 is the prober's own vantage (a timeout,
+      # or the URL secret unset), and going red for that trains the alarm away.
+      - name: Fail
+        if: steps.probe.outputs.rc == '1'
+        run: exit 1

@@ -1,0 +1,95 @@
+# Verify a deploy from production, on demand after a build goes live.
+#
+# Dispatch, not schedule: this runs once after a deploy, with the build log's
+# sitemap URL total as input, and asserts the site is live and correct from the
+# outside (front door, sitemap total, every embed https under CSP frame-src
+# https:, no retired host or legacy relay button, the /r/ resolver resolves, the tag
+# 301s fold, deleted leftovers 404). A recurring version of most of this is the
+# daily check-servers and site-up watches; this is the per-deploy gate.
+#
+# Public repo: counts and pass/fail to the log, the named detail (which page,
+# which host) to the email.
+name: check-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      sitemap_n:
+        description: "build log 'sitemap: N URLs' (0 to report the count, not judge it)"
+        default: '0'
+      pages:
+        description: 'watch pages to sample'
+        default: '50'
+
+concurrency:
+  group: check-deploy
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        working-directory: code
+        run: python -m pip install --quiet curl_cffi
+
+      - name: Verify the deploy
+        id: dep
+        working-directory: code
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          rc=0
+          python scripts/ci/check_deploy.py \
+            --sitemap-n "${{ github.event.inputs.sitemap_n || 0 }}" \
+            --pages "${{ github.event.inputs.pages || 50 }}" \
+            --report ../deploy.txt > ../deploy.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../deploy.log
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status:   ${{ steps.dep.outputs.status || 'unknown' }}"
+          echo "failures: ${{ steps.dep.outputs.failures || '?' }}"
+          echo "exit:     ${{ steps.dep.outputs.rc }} (2 = could not sample)"
+
+      - name: Mail
+        if: always() && steps.dep.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[deploy] post-deploy check ${{ steps.dep.outputs.status || 'failed' }} (${{ steps.dep.outputs.failures || '?' }} failure(s))" \
+            --note "Run after the build went live. A failure means the deploy is wrong from a viewer's vantage: a missing page, a broken sitemap total, a non-https or retired embed, a dead /r/ resolve, a tag 301 that did not fold, or a leftover that did not 404." \
+            --body-file deploy.txt --body-file deploy.log
+
+      - name: Fail
+        if: steps.dep.outputs.rc == '1'
+        run: exit 1

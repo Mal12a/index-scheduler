@@ -1,0 +1,112 @@
+# Is every server on a live page actually playable, the way a viewer meets it?
+#
+# On 2026-10-09/10 a live page carried 15 dead servers of 41 and no check caught
+# one: host_liveness.json was 11 days old and only asked "does the host answer",
+# and check_playback presses play on the DEFAULT server of 10 pages only. Dead
+# for a real viewer looked live: one host sent X-Frame-Options SAMEORIGIN
+# (every browser refuses the frame), some had no DNS, one host's video CDN
+# hung, one answered 200 with an 80-byte "removed" page, and a direct stream
+# looped on its first seconds because the Worker dropped the
+# chunk query.
+#
+# This samples live watch pages from the sitemap and tests EVERY server the way
+# a browser does: framing headers (XFO, CSP frame-ancestors), DNS, TLS, removal
+# text, a 1 KB fetch of the media file an embed names, and chunk 1 vs chunk 2 for
+# direct streams. It fails when a host has >=2 samples that are ALL dead, or a
+# stream loops. Providers die between builds, so this runs daily, not per build.
+#
+# Public repo: stdout is counts only. The per-host detail NAMES provider hosts,
+# so it goes to the emailed report, never to the log. Random sampling means one
+# run does not see every host; a big dead host surfaces across days.
+name: check-servers
+
+on:
+  schedule:
+    - cron: '35 7 * * *'
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: 'watch pages to sample'
+        default: '150'
+
+concurrency:
+  group: check-servers
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        working-directory: code
+        run: python -m pip install --quiet curl_cffi
+
+      # stdout is counts only (safe for the public log); the named per-host
+      # detail goes to ../servers.txt for the email. rc is captured, not
+      # swallowed: bash -e would otherwise end the step on a non-zero exit.
+      - name: Test every server on sampled pages
+        id: srv
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          python scripts/ci/check_servers.py \
+            --pages "${{ github.event.inputs.pages || 150 }}" \
+            --report ../servers.txt > ../servers.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../servers.log
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "status: ${{ steps.srv.outputs.status || 'unknown' }}"
+          echo "dead:    ${{ steps.srv.outputs.dead || '?' }} host(s) dead for every viewer (vantage-independent)"
+          echo "suspect: ${{ steps.srv.outputs.suspect || '?' }} host(s) need a residential/browser confirm"
+          echo "loops:   ${{ steps.srv.outputs.loops || '?' }} stream(s) looping"
+          echo "exit:   ${{ steps.srv.outputs.rc }} (2 = could not sample)"
+
+      # Mail on a real finding (1) or a blind run (2). The report names hosts; it
+      # is a file, never the log.
+      - name: Mail
+        if: always() && (steps.srv.outputs.rc != '0' || steps.srv.outputs.suspect != '0')
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SUB="[watch] a server is dead for every viewer (${{ steps.srv.outputs.dead || '?' }} host(s), ${{ steps.srv.outputs.suspect || '0' }} suspect, ${{ steps.srv.outputs.loops || '?' }} looping)"
+          [ "${{ steps.srv.outputs.rc }}" = "0" ] && SUB="[watch] ${{ steps.srv.outputs.suspect }} server(s) need a residential confirm (none hard-dead)"
+          [ "${{ steps.srv.outputs.rc }}" = "2" ] && SUB="[watch] check-servers could not sample any page"
+          python3 scripts/mail.py \
+            --subject "$SUB" \
+            --note "DEAD hosts failed a vantage-independent signal (refused framing, dead DNS, bad TLS) and are safe to act on. SUSPECT hosts failed only a geo/referer-dependent signal (a datacenter 403, a timeout, a country removed-page) and must be confirmed from a residential or real browser before dropping: a US datacenter runner is not a viewer. Sampling is random, so a host missing here may still be dead; it surfaces across days." \
+            --body-file servers.txt --body-file servers.log
+
+      # Red only on a real dead host (1). Exit 2 means it could not sample, which
+      # is the prober's vantage, not a dead server, so it does not go red.
+      - name: Fail
+        if: steps.srv.outputs.rc == '1'
+        run: exit 1

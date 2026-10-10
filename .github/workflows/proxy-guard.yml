@@ -1,0 +1,97 @@
+# Is the paid lookup path (serverless + residential proxy) within budget?
+#
+# Lookups go through a serverless function + a US residential proxy first
+# (5 GB prepaid, $0.50/GB), the Macs are the fallback. A retry loop, a bot storm
+# or a broken route could burn the prepaid balance, and the proxy vendor exposes no
+# usage API, so this counts the proxy requests the Worker logged to Analytics
+# Engine and compares them with the measured budget.
+#
+# ALERT ONLY (Arun, 2026-10-08): --alert-only never touches R2, so it never
+# writes the kill flag and the public repo needs no R2 credentials. It only
+# mails when over budget; the decision to switch the paid path off stays a human one.
+# Exit 2 = over budget, exit 1 = the guard could not read Analytics Engine.
+#
+# Hourly, because a runaway spends fast. The alert runs from the runner, never
+# from the thing it watches. Public repo: counts and a dollar estimate reach the
+# log, never a host or a token.
+name: proxy-guard
+
+on:
+  schedule:
+    - cron: '15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: proxy-guard
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        working-directory: code
+        run: python -m pip install --quiet curl_cffi
+
+      # --alert-only: read Analytics Engine, judge the budget, exit 2 if over.
+      # Never constructs an R2 client, so no R2 keys are needed here.
+      - name: Check the proxy budget
+        id: guard
+        working-directory: code
+        continue-on-error: true
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          rc=0
+          python scripts/ops/proxy_guard.py --alert-only > ../guard.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../guard.log
+
+      - name: Say only what is safe to say in public
+        run: |
+          echo "exit: ${{ steps.guard.outputs.rc }} (0 within budget, 2 over, 1 blind)"
+
+      # Mail on over-budget (2) or blind (1). The guard's own stdout carries the
+      # counts and the dollar estimate, no host or token, so it is safe to send.
+      - name: Mail
+        if: always() && steps.guard.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SUB="[watch] proxy lookup path over budget"
+          [ "${{ steps.guard.outputs.rc }}" = "1" ] && SUB="[watch] proxy guard is blind"
+          python3 scripts/mail.py \
+            --subject "$SUB" \
+            --note "Alert only; the paid lookup path was NOT disabled. Review the numbers and, if it is a real runaway, trip the switch yourself: scripts/ops/proxy_guard.py (no --dry-run), or clear a stuck one with --clear." \
+            --body-file guard.log
+
+      - name: Fail
+        if: steps.guard.outputs.rc != '0'
+        run: exit 1
