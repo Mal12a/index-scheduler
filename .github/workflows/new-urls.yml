@@ -91,17 +91,26 @@ jobs:
           echo "status: ${{ steps.detect.outputs.status || 'unknown' }}"
           echo "queued: ${{ steps.detect.outputs.queued || '?' }} new URL(s)"
           echo "dark:   ${{ steps.detect.outputs.dark || '?' }} upstream(s) did not answer"
+          # "unknown" here means the code was never reached: the step writes these outputs
+          # itself, so an empty value is a run that died before the probe.
 
       - name: Commit the queue
         if: steps.detect.outputs.rc != '2' && (github.event_name == 'schedule' || github.event.inputs.write_queue == 'true')
         working-directory: code
         run: |
-          if git diff --quiet -- data/watch/; then
+          # status, not diff: git diff ignores untracked files, and the frontier
+          # is a new folder, so a diff check said "unchanged" on every run and
+          # the frontier was never committed. Every run then started cold,
+          # seeded, and queued nothing (0 queued, 2026-09-24 to 2026-10-19).
+          if [ -z "$(git status --porcelain -- data/watch/)" ]; then
             echo "queue unchanged"; exit 0
           fi
           git config user.name  "new-urls"
           git config user.email "actions@users.noreply.github.com"
-          git add data/watch/crawl_queue.jsonl data/watch/url_frontier.json data/watch/queue
+          # The whole directory: the frontier is one sorted file per source now, and
+          # naming a path that does not exist yet (no URL ever queued) is fatal to
+          # git add. Crawl output under data/watch/parts/ is gitignored.
+          git add -A -- data/watch/
           git commit -q -m "Queue the pages upstreams published since the last run"
           # Another job may have pushed between checkout and now. Rebase rather
           # than force: the queue is append-only and both sides' URLs matter.
