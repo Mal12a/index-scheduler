@@ -1,0 +1,101 @@
+# Suspect players, mailed once per host, never once per page.
+#
+# check_playback presses play in a real browser. From an automated datacenter
+# browser some pages cannot be judged (an anti-bot guard that bounces
+# automation, a datacenter or geo block, a dead media host), so they are
+# suspects, not failures, and the private players job stays green on them. This
+# mails a host the first time it turns suspect, and again only if it comes back
+# after 30 quiet days. Hosts a real viewer has confirmed playing are never
+# mailed. The pages are a fresh random sample every run, which is why the unit
+# of alerting is the host: per page it would mail every day.
+#
+# The hosts already mailed live in the Actions cache. They are saved only after
+# the mail step succeeds, so a failed send is retried on the next run rather
+# than silently marked done. A lost cache costs one repeat mail, nothing more.
+#
+# Public repo: counts to the log; hosts and pages only in the email.
+name: player-suspects
+
+on:
+  schedule:
+    - cron: '41 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: player-suspects
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          pip install --quiet playwright httpx
+          python -m playwright install --with-deps chromium > /dev/null
+
+      - name: Restore the hosts already mailed
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: player-suspects-${{ github.run_id }}
+          restore-keys: player-suspects-
+
+      # A hard failure (our CSP, our markup) is the private players job's to
+      # report, and it goes red there. This job only digests the suspects, so
+      # the browser check's own exit code is not a verdict here; the digest's is.
+      - name: Press play
+        working-directory: code
+        run: |
+          python scripts/ci/check_playback.py --live --n 10 \
+            --suspects-json ../suspects.json > ../playback.log 2>&1 || true
+
+      - name: Digest by host
+        id: dig
+        working-directory: code
+        run: |
+          python scripts/ci/suspect_digest.py --suspects ../suspects.json \
+            --state ../seen.json --ok data/watch/suspect_hosts_ok.json \
+            --report ../digest.txt
+
+      - name: Mail new suspect hosts
+        if: steps.dig.outputs.new != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[players] ${{ steps.dig.outputs.new }} new suspect player host(s)" \
+            --note "A host whose pages a CI browser could not judge, mailed once. Suspect is not dead: open one page at home before acting." \
+            --body-file digest.txt
+
+      - name: Save the hosts already mailed
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: player-suspects-${{ github.run_id }}
