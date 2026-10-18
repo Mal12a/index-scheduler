@@ -36,8 +36,10 @@ read.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -47,6 +49,9 @@ PUSH_WARN_DAYS = 45      # the cliff is 60; this leaves two weeks of warning
 MAX_RUN_AGE_H = 48       # every workflow here runs daily or more often
 SETUP_STEPS = ("Set up job", "Refuse to start without the deploy key",
                "Run actions/checkout@v4", "actions/checkout@v4")
+# The watchdog fails whenever it finds anything, so judging its own history
+# reports "never succeeded" forever once anything else has ever been red.
+SELF = os.environ.get("GITHUB_WORKFLOW", "watchdog")
 
 
 def api(path: str) -> dict:
@@ -96,15 +101,19 @@ def judge(repo: dict, workflows: list[dict], now: datetime) -> list[str]:
         if state != "active":
             f.append(f"{name}: state {state}, so it is not being scheduled at all")
             continue
+        # Started only by hand (check-deploy): there is no schedule to miss, so
+        # "never run" and "last run too old" say nothing about it.
+        manual = not w.get("scheduled", True)
         last = w.get("last")
         if last is None:
-            f.append(f"{name}: has never run")
+            if not manual:
+                f.append(f"{name}: has never run")
             continue
         a = age_h(last.get("created_at"), now)
-        if a is not None and a > MAX_RUN_AGE_H:
+        if not manual and a is not None and a > MAX_RUN_AGE_H:
             f.append(f"{name}: last run {a:.0f}h ago, over {MAX_RUN_AGE_H}h; the "
                      f"schedule is not being delivered")
-        if w.get("last_ok") is None:
+        if w.get("last_ok") is None and name != SELF:
             f.append(f"{name}: has never succeeded")
         step = died_at(w.get("jobs") or {})
         if step:
@@ -123,8 +132,27 @@ def fetch(repo_name: str) -> tuple[dict, list[dict]]:
                  f"?status=success&per_page=1")
         jobs = api(f"repos/{repo_name}/actions/runs/{last['id']}/jobs") if last else {}
         out.append({"wf": wf, "last": last, "jobs": jobs,
-                    "last_ok": (ok.get("workflow_runs") or [None])[0]})
+                    "last_ok": (ok.get("workflow_runs") or [None])[0],
+                    "scheduled": scheduled(repo_name, wf.get("path", ""))})
     return repo, out
+
+
+def scheduled(repo_name: str, path: str) -> bool:
+    """Whether the workflow file has a schedule trigger. A file that cannot be
+    read counts as scheduled, so it keeps the strict judgement."""
+    try:
+        doc = api(f"repos/{repo_name}/contents/{path}")
+        text = base64.b64decode(doc.get("content", "")).decode("utf-8", "replace")
+    except (urllib.error.URLError, KeyError, ValueError):
+        return True
+    return has_schedule(text)
+
+
+def has_schedule(text: str) -> bool:
+    """A real `schedule:` key, not the word in a comment: check-deploy.yml's
+    header says "Dispatch, not schedule:" and a substring test matched it."""
+    return any(re.match(r"\s*schedule\s*:", line.split("#", 1)[0])
+               for line in text.splitlines())
 
 
 def selfcheck() -> None:
@@ -154,6 +182,19 @@ def selfcheck() -> None:
     assert any("never succeeded" in s for s in judge({"pushed_at": "2026-10-20T00:00:00Z"},
                                                      [never], now))
     assert judge({"pushed_at": "2026-10-20T00:00:00Z"}, [], now), "no workflows is a finding"
+    manual = dict(healthy, last=None, last_ok=None, scheduled=False)
+    assert judge({"pushed_at": "2026-10-20T00:00:00Z"}, [manual], now) == [], \
+        "a hand-started workflow that has never run is not a finding"
+    me = dict(healthy, wf={"name": SELF, "state": "active"}, last_ok=None)
+    assert judge({"pushed_at": "2026-10-20T00:00:00Z"}, [me], now) == [], \
+        "the watchdog must not fail on its own history"
+    unread = dict(healthy, last=None)
+    assert any("never run" in s for s in judge({"pushed_at": "2026-10-20T00:00:00Z"},
+                                                [unread], now)), \
+        "a workflow whose file could not be read keeps the strict judgement"
+    assert has_schedule("on:\n  schedule:\n    - cron: '0 6 * * *'\n")
+    assert not has_schedule("# Dispatch, not schedule: runs after a deploy\n"
+                            "on:\n  workflow_dispatch:\n")
     print("selfcheck ok: fires on each failure, passes a healthy repo")
 
 
