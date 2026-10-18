@@ -1,7 +1,7 @@
 # A host that no longer resolves is dead for every viewer, and nothing in the
 # pipeline notices on its own.
 #
-# turbovidhls.com served 6 of 6 samples in the liveness pass on 2026-09-27 and
+# One player host served 6 of 6 samples in the liveness pass on 2026-09-27 and
 # had lost its A record before 2026-10-05. Nothing re-read that verdict, so for
 # eight days it shipped as a live player on 312,296 entries, and 3,453 pages
 # carried it as their LAST player: open one and every button is dead. The record
