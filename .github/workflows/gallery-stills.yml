@@ -1,0 +1,78 @@
+# Do the hotlinked gallery stills still load, per host?
+#
+# Watch pages hotlink sample stills from a handful of distributors, and a gallery
+# cell removes itself when its image fails. A host that starts blocking or
+# removing stills is therefore invisible to a viewer: galleries just disappear.
+# This samples 20 real first-still URLs per host from the committed probe pool
+# and fetches each the way the page does (browser UA, no Referer, no redirect
+# followed). A host alerts only past 25% of its sample, so one dead title pages
+# nobody. A runner is one vantage: the email says how to recheck from home.
+#
+# Public repo: counts to the log; hosts, statuses and URLs only in the email.
+name: gallery-stills
+
+on:
+  schedule:
+    - cron: '20 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: gallery-stills
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: python -m pip install --quiet curl_cffi
+
+      - name: Probe the stills
+        id: probe
+        working-directory: code
+        continue-on-error: true
+        run: |
+          rc=0
+          python scripts/watch/gallery_check.py --report ../gallery.txt > ../gallery.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../gallery.log
+
+      - name: Mail
+        if: always() && steps.probe.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[gallery] ${{ steps.probe.outputs.alerting || '?' }} still host(s) failing" \
+            --note "A host whose stills stopped loading from this runner. Galleries on its pages are emptying for viewers. A 403 from one IP is not proof: recheck from home before acting." \
+            --body-file gallery.txt --body-file gallery.log
+
+      - name: Fail
+        if: steps.probe.outputs.rc != '0'
+        run: exit 1
