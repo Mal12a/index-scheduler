@@ -65,6 +65,10 @@ def flags_a_script_accepts(path: pathlib.Path) -> set[str] | None:
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
                         and arg.value.startswith("--"):
                     out.add(arg.value)
+        # Hand-parsed argv: proxy_guard.py reads `"--alert-only" in args`.
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Constant) \
+                and isinstance(node.left.value, str) and FLAG.fullmatch(node.left.value):
+            out.add(node.left.value)
     return out
 
 
@@ -101,6 +105,9 @@ def selfcheck() -> None:
     # A flag after a shell operator belongs to another command.
     got = calls_in("python scripts/x.py --included 5 || echo --oops\n")[0][1]
     assert got == {"--included"}, got
+    # A script that reads sys.argv by hand accepts what it tests for, and only that.
+    tmp.write_text("import sys\nargs = set(sys.argv[1:])\nif '--alert-only' in args: pass\nx = '--not-a-test'\n")
+    assert flags_a_script_accepts(tmp) == {"--alert-only"}, flags_a_script_accepts(tmp)
     tmp.unlink()
     print("selfcheck ok: catches an unknown flag, accepts a known one")
 
