@@ -1,0 +1,92 @@
+# Does every stream kind reach video bytes from a network that did not mint it?
+#
+# A check that stops at the first answer is green on a stream that cannot play:
+# a resolve answered 200 with a playlist that refused every network but the one
+# that minted it. This runner is never that network. For each kind it fetches
+# what the player fetches next, down to 4 KB of one segment, with the player's
+# headers, and checks CORS on every cross-origin request the player makes. A kind
+# alerts past 25% of its sample after one retry, so one dead file pages nobody.
+# Gating kinds are the ones this ship serves; the rest are reported only.
+#
+# STREAM_PRE_UPLOAD (repository variable, "1" until a ship uploads the new
+# playlists): lets one kind fall back to the playlist as the build will publish
+# it. Clear it after the ship so the served playlist is required.
+#
+# Public repo: counts and step names to the log; kinds, hosts and URLs only in
+# the email.
+name: stream-chain
+
+on:
+  schedule:
+    - cron: '50 5 * * *'
+  workflow_dispatch:
+    inputs:
+      per_kind:
+        description: 'samples per kind'
+        default: '8'
+
+concurrency:
+  group: stream-chain
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: python -m pip install --quiet curl_cffi
+
+      - name: Follow the chains
+        id: probe
+        working-directory: code
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          rc=0
+          pre=""
+          [ "${{ vars.STREAM_PRE_UPLOAD }}" = "1" ] && pre="--pre-upload"
+          python scripts/watch/stream_chain.py --per-kind "${{ github.event.inputs.per_kind || 8 }}" \
+            $pre --report ../streams.txt > ../streams.log 2>&1 || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat ../streams.log
+
+      - name: Mail
+        if: always() && steps.probe.outputs.rc != '0'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/mail.py \
+            --subject "[streams] ${{ steps.probe.outputs.alerting || '?' }} stream kind(s) not reaching video" \
+            --note "From a GitHub runner, which never minted these streams. Each line says where the chain stopped and what it saw there." \
+            --body-file streams.txt --body-file streams.log
+
+      - name: Fail
+        if: steps.probe.outputs.rc != '0'
+        run: exit 1
