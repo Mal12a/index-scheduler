@@ -1,0 +1,142 @@
+# The private repo's per-push checks, run here where minutes are free.
+#
+# Arun, 2026-10-21: the private repo's own `checks` workflow ran on every push,
+# about 9 minutes each, 18 to 26 pushes a day from the sessions' API commits,
+# and that account's minutes are billed. That workflow now runs only by hand.
+#
+# `unit` wakes hourly and tests main only when main has moved since the last
+# test: the tested sha is kept as a cache key, saved whether the run passed or
+# failed, so a red commit mails once rather than every hour. A bad push is
+# caught within the hour instead of the minute, at no cost.
+#
+# `players` is the old private job that needs a browser, once a day.
+#
+# Public repo: the check list lives in the private scripts/ci/unit_checks.sh,
+# which prints only "check N: ok / FAILED / NOT CHECKED"; each check's command
+# and output go to a numbered log that is mailed on failure.
+name: unit
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: unit-${{ github.event.schedule || 'dispatch' }}
+  cancel-in-progress: false
+
+jobs:
+  unit:
+    if: github.event.schedule != '17 4 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to start without the deploy key
+        env:
+          KEY: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::PIPELINE_DEPLOY_KEY is not set on this repository, so the private code cannot be checked out"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - name: Which commit
+        id: sha
+        run: echo "sha=$(git -C code rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Tested already?
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .tested
+          key: unit-${{ steps.sha.outputs.sha }}
+          lookup-only: true
+
+      - uses: actions/setup-python@v5
+        if: steps.seen.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          python-version: '3.12'
+
+      - name: Run the checks
+        id: checks
+        if: steps.seen.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        working-directory: code
+        run: bash scripts/ci/unit_checks.sh .. unit
+
+      - name: Remember this commit was tested
+        if: always() && steps.checks.outcome != 'skipped'
+        run: mkdir -p .tested && echo "${{ steps.sha.outputs.sha }}" > .tested/sha
+
+      - uses: actions/cache/save@v4
+        if: always() && steps.checks.outcome != 'skipped' && steps.seen.outputs.cache-hit != 'true'
+        with:
+          path: .tested
+          key: unit-${{ steps.sha.outputs.sha }}
+
+      - name: Mail
+        if: always() && steps.checks.outputs.rc == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          files=""
+          for f in *.log; do [ -s "$f" ] && files="$files --body-file $f"; done
+          python3 scripts/mail.py \
+            --subject "[unit] main ${{ steps.sha.outputs.sha }}: check(s) ${{ steps.checks.outputs.failed }} failed" \
+            --note "Unit checks on a commit to the private repo's main. Sent once per commit." $files
+
+      - name: Fail
+        if: steps.checks.outputs.rc == '1'
+        run: exit 1
+
+  players:
+    if: github.event.schedule == '17 4 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.PRIVATE_REPO }}
+          ref: main
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          path: code
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run the browser checks
+        id: checks
+        working-directory: code
+        run: bash scripts/ci/unit_checks.sh .. players
+
+      - name: Mail
+        if: always() && steps.checks.outputs.rc == '1'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          files=""
+          for f in *.log; do [ -s "$f" ] && files="$files --body-file $f"; done
+          python3 scripts/mail.py --subject "[players] browser check(s) ${{ steps.checks.outputs.failed }} failed" \
+            --note "The private repo's old players job, daily." $files
+
+      - name: Fail
+        if: steps.checks.outputs.rc == '1'
+        run: exit 1
