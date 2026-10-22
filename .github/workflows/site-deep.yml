@@ -102,6 +102,7 @@ jobs:
       - name: Say only what is safe to say in public
         run: |
           echo "deep:   ${{ steps.deep.outputs.status || 'unknown' }} (${{ steps.deep.outputs.failures || '?' }} failures)"
+          echo "failed: ${{ steps.deep.outputs.failed || '-' }}"
           echo "slug:   exit ${{ steps.slug.outputs.rc }}"
 
       - name: Mail on failure
