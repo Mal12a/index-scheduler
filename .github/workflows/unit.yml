@@ -124,6 +124,11 @@ jobs:
         working-directory: code
         run: bash scripts/ci/unit_checks.sh .. players
 
+      - name: Which stream kinds play in Chrome (numbers only)
+        if: always()
+        run: |
+          echo "play: ${{ steps.checks.outputs.play || 'not run' }}"
+
       - name: Mail
         if: always() && steps.checks.outputs.rc == '1'
         env:
